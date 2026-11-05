@@ -1,0 +1,56 @@
+services:
+  llama-sycl:
+    image: ghcr.io/linktothedata/llama-sycl:latest
+    container_name: llama-sycl
+    restart: unless-stopped
+
+    # --- WSL2 GPU passthrough (fireball) ---
+    # Same shape that fixed torch.xpu device-count in llm-scaler-vllm: the
+    # Intel driver/ICD files live under /usr/lib/wsl/drivers, a sibling of
+    # lib/, so mount the WHOLE /usr/lib/wsl, not just /usr/lib/wsl/lib.
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - /home/fireball/docker/llama-sycl/models:/models
+      - /home/fireball/docker/llama-sycl/sycl-cache:/sycl-cache
+    # --- Native Linux host instead? Drop the two lines above and use: ---
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add: ["video", "render"]
+
+    environment:
+      # /usr/lib/wsl/lib must come first so the WSL Level Zero loader wins
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib:/opt/intel/oneapi/lib:/usr/lib/x86_64-linux-gnu
+      # Upstream's image is JIT (no AOT device arch baked in). Persisting the
+      # SYCL kernel cache makes that a one-time cost per model/driver combo
+      # instead of a warm-up tax on every container start.
+      SYCL_CACHE_PERSISTENT: "1"
+      SYCL_CACHE_DIR: /sycl-cache
+      ZES_ENABLE_SYSMAN: "1"
+      # Uncomment if Level Zero v2 adapter misbehaves on this driver:
+      # SYCL_UR_USE_LEVEL_ZERO_V2: "0"
+
+    ports:
+      - "8082:8080"   # 11435 is ollama-sycl, 8081 is whisper-sycl
+
+    command: >
+      -m /models/qwen3.6-27b-Q4_K_M.gguf
+      --alias qwen3.6-27b
+      -ngl 999
+      -c 32768
+      --flash-attn on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -b 2048
+      -ub 512
+      --no-mmap
+      --host 0.0.0.0
+      --port 8080
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s

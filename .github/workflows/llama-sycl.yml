@@ -1,0 +1,109 @@
+name: Build llama.cpp SYCL
+
+# Builds llama.cpp's upstream .devops/intel.Dockerfile (server target) and
+# publishes to ghcr.io/linktothedata/llama-sycl
+#
+# Upstream handles the hard parts: oneAPI build stage with icx/icpx, and a
+# runtime stage that installs pinned Intel IGC + compute-runtime + GMM debs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'llama.cpp ref to build: "latest" (newest release tag), "master", or an explicit tag/sha'
+        required: false
+        default: 'latest'
+      sycl_f16:
+        description: 'Build with GGML_SYCL_F16'
+        required: false
+        default: 'ON'
+        type: choice
+        options: ['ON', 'OFF']
+  schedule:
+    # Sundays 06:00 UTC — rebuild against the newest release tag
+    - cron: '0 6 * * 0'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/llama-sycl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Resolve llama.cpp ref
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ github.event.inputs.ref || 'latest' }}
+        run: |
+          set -euo pipefail
+          if [ "$INPUT_REF" = "latest" ]; then
+            REF=$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)
+          else
+            REF="$INPUT_REF"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          # sanitise for use as a docker tag
+          echo "tag=$(echo "$REF" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          echo "Building llama.cpp @ $REF"
+
+      # The oneAPI build image is very large. Default runners have ~14 GB free;
+      # this reclaims ~30 GB and is the difference between a build and a
+      # "no space left on device" at 80% through the compile.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .devops/intel.Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            GGML_SYCL_F16=${{ github.event.inputs.sycl_f16 || 'ON' }}
+            APP_VERSION=${{ steps.ref.outputs.ref }}
+            BUILD_DATE=${{ github.run_id }}
+            APP_REVISION=${{ steps.ref.outputs.ref }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ref.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Summary
+        run: |
+          {
+            echo "### llama.cpp SYCL built"
+            echo ""
+            echo "- ref: \`${{ steps.ref.outputs.ref }}\`"
+            echo "- image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ref.outputs.tag }}\`"
+            echo "- F16: \`${{ github.event.inputs.sycl_f16 || 'ON' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
